@@ -636,3 +636,218 @@ def test_a_partial_translation_publishes_the_source_cues_and_a_partial_footer(qu
     assert any("partially translated" in cue.content for cue in published)
     assert fixture.service.partial_error == (
         "Gemini returned 0 of 1 cues for one batch; the rest keep the source text.")
+
+
+def test_build_scene_blocks_splits_at_silence_gaps_and_carries_previous_context():
+    import datetime
+    from subtitles.tools.translate.core.context_bible import build_scene_blocks
+
+    cues = [
+        gemini_translator.srt.Subtitle(
+            index=1,
+            start=datetime.timedelta(seconds=1),
+            end=datetime.timedelta(seconds=2),
+            content="<i>Hello Sarah!</i>",
+        ),
+        gemini_translator.srt.Subtitle(
+            index=2,
+            start=datetime.timedelta(seconds=2, milliseconds=200),
+            end=datetime.timedelta(seconds=4),
+            content="Are you tired?",
+        ),
+        gemini_translator.srt.Subtitle(
+            index=3,
+            start=datetime.timedelta(seconds=10),
+            end=datetime.timedelta(seconds=13),
+            content="Yes, Doctor, very tired.",
+        ),
+    ]
+
+    blocks = build_scene_blocks(
+        cues,
+        max_block_size=10,
+        min_block_size=2,
+        scene_pause_seconds=3.0,
+        context_lines=2,
+    )
+
+    assert len(blocks) == 2
+    assert [c.index for c in blocks[0].cues] == ["0", "1"]
+    assert blocks[0].previous_context == []
+    assert blocks[0].next_context == ["Yes, Doctor, very tired."]
+    assert [c.index for c in blocks[1].cues] == ["2"]
+    assert blocks[1].previous_context == ["Hello Sarah!", "Are you tired?"]
+    assert blocks[1].next_context == []
+    assert blocks[1].pause_before == pytest.approx(6.0)
+    assert 16 <= blocks[1].cues[0].max_chars <= 84
+
+
+def test_selective_audio_gender_probing_annotates_ambiguous_cues(tmp_path, monkeypatch):
+    import datetime
+    from subtitles.tools.translate.core.context_bible import build_scene_blocks, find_gender_ambiguous_cues
+
+    cues = [
+        gemini_translator.srt.Subtitle(
+            index=1,
+            start=datetime.timedelta(seconds=2),
+            end=datetime.timedelta(seconds=4),
+            content="Here is your peppermint tea.",
+        ),
+        gemini_translator.srt.Subtitle(
+            index=2,
+            start=datetime.timedelta(seconds=5),
+            end=datetime.timedelta(seconds=7),
+            content="Thank you. I am completely exhausted.",
+        ),
+        gemini_translator.srt.Subtitle(
+            index=3,
+            start=datetime.timedelta(seconds=8),
+            end=datetime.timedelta(seconds=10),
+            content="[Harrison] Thank you for waiting.",
+        ),
+    ]
+    bible = {"characters": [{"name": "Harrison", "gender": "M"}]}
+    blocks = build_scene_blocks(cues)
+    ambiguous = find_gender_ambiguous_cues(blocks, bible=bible)
+
+    # Cue 1 has no 1st-person gender marker; Cue 3 has known [Harrison] tag (M); only Cue 2 is ambiguous
+    assert [c.index for c in ambiguous] == ["1"]
+
+    fake_video = tmp_path / "movie.mkv"
+    fake_video.write_bytes(b"0" * 8192)
+    monkeypatch.setattr(gemini_translator, "extract_audio_microclip_wav_b64", lambda *a, **k: "UklGRg==")
+
+    def fake_probe_request(method, url, **kwargs):
+        return _gemini_batch_response([{"index": "1", "speaker_gender": "F"}])
+
+    monkeypatch.setattr(gemini_translator.requests, "request", fake_probe_request)
+    service = _build_service()
+    service.video_path = str(fake_video)
+    service.current_api_key = "key-1"
+    service.context_bible = bible
+    service._resolve_audio_speaker_genders(blocks)
+
+    assert blocks[0].cues[1].speaker_gender == "F"
+    assert blocks[0].cues[1].to_prompt_dict() == {
+        "index": "1",
+        "content": "Thank you. I am completely exhausted.",
+        "speaker_gender": "F",
+    }
+
+
+def test_normalize_bible_merges_tmdb_cast_genders_with_llm_characters():
+    from subtitles.tools.translate.core.context_bible import normalize_bible
+
+    known_cast = [
+        {"name": "Sarah Connor", "gender": "F", "actor": "Linda Hamilton"},
+        {"name": "Dr. Silberman", "gender": "?", "actor": "Earl Boen"},
+    ]
+    llm_raw = {
+        "characters": [
+            {"name": "Sarah Connor", "gender": "M", "notes": "protagonist"},
+            {"name": "Dr. Silberman", "gender": "M", "notes": "psychiatrist"},
+            {"name": "Kyle Reese", "gender": "M", "notes": "resistance soldier"},
+        ],
+        "relations": [
+            {
+                "from": "Sarah Connor",
+                "to": "Dr. Silberman",
+                "relation": "patient to doctor",
+                "formality": "o senhor",
+            }
+        ],
+        "glossary": [
+            {"term": "Cyberdyne", "translation": "Cyberdyne"},
+        ],
+        "tone": "1980s sci-fi thriller, tense",
+    }
+
+    bible = normalize_bible(llm_raw, known_cast=known_cast, overview="A cyborg assassin is sent back in time.")
+    by_name = {c["name"]: c for c in bible["characters"]}
+
+    # Known TMDB gender F overrides conflicting LLM gender M
+    assert by_name["Sarah Connor"]["gender"] == "F"
+    assert by_name["Sarah Connor"]["notes"] == "protagonist"
+    # Unknown TMDB gender ? is filled by LLM gender M
+    assert by_name["Dr. Silberman"]["gender"] == "M"
+    assert by_name["Kyle Reese"]["gender"] == "M"
+    assert bible["relations"][0]["formality"] == "o senhor"
+    assert bible["glossary"] == [{"term": "Cyberdyne", "translation": "Cyberdyne"}]
+
+
+def test_gemini_translator_builds_context_bible_and_translates_scene_blocks(tmp_path, monkeypatch):
+    from subtitles.tools.translate.core import context_bible
+
+    context_bible.clear_bible_cache()
+    monkeypatch.setattr(context_bible, "_lookup_local_media_metadata", lambda *a, **k: {
+        "title": "The Matrix",
+        "year": "1999",
+        "imdb_id": "tt0133093",
+        "tmdb_id": "603",
+        "overview": "A hacker learns about the true nature of reality.",
+    })
+    monkeypatch.setattr(context_bible, "fetch_tmdb_cast", lambda *a, **k: [
+        {"name": "Trinity", "gender": "F", "actor": "Carrie-Anne Moss"},
+    ])
+
+    lines = []
+    for idx in range(1, 13):
+        # Introduce a 6-second scene gap before cue 7
+        offset = (idx * 2) if idx < 7 else (idx * 2 + 6)
+        lines.append(
+            f"{idx}\n00:00:{offset:02d},000 --> 00:00:{offset + 1:02d},500\nLine {idx} from Trinity\n"
+        )
+    input_file = tmp_path / "matrix.en.srt"
+    output_file = tmp_path / "matrix.pt-BR.srt"
+    input_file.write_text("\n".join(lines), encoding="utf-8")
+
+    service = _build_service()
+    service.input_file = str(input_file)
+    service.output_file = str(output_file)
+    service.api_keys = ["key-1"]
+    service.current_api_key = "key-1"
+    service.target_language = "Portuguese (Brazil)"
+    service.job_id = "job-scene-1"
+
+    sent_payloads = []
+
+    def fake_request(method, url, **kwargs):
+        body = json.loads(kwargs["data"])
+        sent_payloads.append(body)
+        if len(sent_payloads) == 1:
+            # First call is the Context Bible pre-pass
+            bible_reply = {
+                "characters": [{"name": "Trinity", "gender": "F", "notes": "hacker"}],
+                "relations": [{"from": "Trinity", "to": "Neo", "relation": "allies", "formality": "você"}],
+                "glossary": [{"term": "Nebuchadnezzar", "translation": "Nabucodonosor"}],
+                "tone": "cyberpunk action",
+            }
+            return _gemini_batch_response(bible_reply)
+        user_payload = json.loads(body["contents"][0]["parts"][0]["text"])
+        cues = user_payload["cues"] if isinstance(user_payload, dict) else user_payload
+        translated_cues = [
+            {"index": item["index"], "content": f"Fala {int(item['index']) + 1} da Trinity (cansada)"}
+            for item in cues
+        ]
+        # Verify wrapped dict response {"cues": [...]} is also accepted under JSON mode
+        return _gemini_batch_response({"cues": translated_cues})
+
+    monkeypatch.setattr(gemini_translator.requests, "request", fake_request)
+    monkeypatch.setattr(gemini_translator.jobs_queue, "update_job_progress", lambda *a, **k: None)
+
+    service._translate_with_gemini()
+
+    # 1 Bible request + 1 scene block (since min_block_size defaults to 20 and total=12)
+    assert len(sent_payloads) == 2
+    translate_sys = sent_payloads[1]["system_instruction"]["parts"][0]["text"]
+    assert "Context Bible:" in translate_sys
+    assert "Trinity" in translate_sys
+    assert "Nabucodonosor" in translate_sys
+    assert sent_payloads[1]["generationConfig"]["responseMimeType"] == "application/json"
+
+    final_subs = list(gemini_translator.srt.parse(output_file.read_text(encoding="utf-8")))
+    assert len(final_subs) == 12
+    assert final_subs[0].content == "Fala 1 da Trinity (cansada)"
+    assert final_subs[11].content == "Fala 12 da Trinity (cansada)"
+    context_bible.clear_bible_cache()
+

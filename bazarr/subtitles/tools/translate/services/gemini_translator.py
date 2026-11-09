@@ -31,6 +31,23 @@ from app.jobs_queue import JobCancelled, jobs_queue
 from languages.get_languages import alpha3_from_alpha2, language_from_alpha2, language_from_alpha3  # noqa: F401
 from ..core.translator_utils import (add_translator_info, get_description, create_process_result,
                                      translation_write_kwargs)
+from ..core.context_bible import (
+    DEFAULT_MAX_SCENE_BLOCK_CUES,
+    MIN_CUES_FOR_CONTEXT_BIBLE,
+    _cache_key,
+    _lookup_local_media_metadata,
+    build_audio_gender_probe_payload,
+    build_bible_prompt,
+    build_scene_blocks,
+    extract_audio_microclip_wav_b64,
+    fetch_tmdb_cast,
+    find_gender_ambiguous_cues,
+    format_bible_for_prompt,
+    load_cached_bible,
+    normalize_bible,
+    sample_dialogue_for_bible,
+    save_cached_bible,
+)
 
 logger = logging.getLogger(__name__)
 DEFAULT_GEMINI_BATCH_SIZE = 300
@@ -104,6 +121,8 @@ class GeminiTranslatorService:
         # the rest stay in the source language, which the job reports as a
         # partial translation instead of failing the item.
         self.partial_error = None
+        self.context_bible = None
+        self.use_context_bible = kwargs.get("use_context_bible", None)
 
     def translate(self, job_id):
         self.job_id = job_id
@@ -184,7 +203,7 @@ class GeminiTranslatorService:
                                   arr_instance_id=self.arr_instance_id)
 
     @staticmethod
-    def get_instruction(language: str, description: str) -> str:
+    def get_instruction(language: str, description: str, bible_json: str = "") -> str:
         """
         Get the instruction for the translation model based on the target language.
         """
@@ -206,6 +225,16 @@ class GeminiTranslatorService:
     """
         if description:
             instruction += "\nAdditional user instruction: '" + description + "'"
+        if bible_json:
+            instruction += (
+                "\n\nContext Bible & Scene Continuity Rules:\n"
+                "- Translate faithfully and literally: preserve the original metaphors, imagery, and exact profanity intensity (never soften swear words like 'fuck'/'fucking' into milder words, and never replace specific metaphors like 'tough as a weed' with generic clichés).\n"
+                "- Do NOT paraphrase, summarize, or omit words.\n"
+                "- When an input cue includes 'speaker_gender': 'F' or 'M' (verified directly from the speaker's audio voice track), you MUST inflect first-person expressions, adjectives, participles, and thanks ('Obrigada' for 'F', 'Obrigado' for 'M', 'exausta'/'pronta'/'sozinha'/'certa' for 'F') to match that exact gender.\n"
+                "- Use the Context Bible, 'previous_scene_context', and 'next_scene_context' ONLY to resolve ambiguities that the source language leaves unmarked: speaker/listener grammatical gender, formality pronouns ('você' vs 'o senhor'/'a senhora'), and proper nouns/glossary terms.\n"
+                "- Never translate or output lines from 'previous_scene_context' or 'next_scene_context'; only output objects for the requested 'cues' array, returning ONLY a JSON array of {'index': str, 'content': str}.\n"
+                f"Context Bible: {bible_json}"
+            )
         return instruction
 
     def _check_saved_progress(self):
@@ -372,12 +401,192 @@ class GeminiTranslatorService:
                 progress_message="Gemini key rate limited. Rotating to another configured key.",
             )
 
-    def _build_generate_payload(self, batch: List[SubtitleObject]) -> dict:
-        return {
+    def _should_use_context_bible(self, total_cues: int) -> bool:
+        if self.use_context_bible is not None:
+            return bool(self.use_context_bible)
+        if not getattr(settings.translator, "gemini_context_bible", True):
+            return False
+        return total_cues >= MIN_CUES_FOR_CONTEXT_BIBLE
+
+    def _ensure_context_bible(self, original_subtitle: List[Subtitle]) -> dict:
+        cache_id = _cache_key(
+            self.media_type,
+            self.arr_instance_id,
+            self.radarr_id,
+            self.sonarr_series_id,
+            self.target_language or self.to_lang,
+        )
+        cached = load_cached_bible(cache_id)
+        if cached:
+            logger.info("Using cached Context Bible for %s", cache_id)
+            return cached
+
+        meta = _lookup_local_media_metadata(
+            self.media_type,
+            self.radarr_id,
+            self.sonarr_series_id,
+            self.sonarr_episode_id,
+            self.arr_instance_id,
+        )
+        known_cast = fetch_tmdb_cast(
+            self.media_type,
+            tmdb_id=meta.get("tmdb_id", ""),
+            imdb_id=meta.get("imdb_id", ""),
+        )
+        samples = sample_dialogue_for_bible(original_subtitle)
+        if not samples:
+            bible = normalize_bible({}, known_cast=known_cast, overview=meta.get("overview", ""))
+            save_cached_bible(cache_id, bible)
+            return bible
+
+        sys_inst, usr_prompt = build_bible_prompt(
+            target_language=self.target_language or "target language",
+            title=meta.get("title", ""),
+            year=meta.get("year", ""),
+            overview=meta.get("overview", ""),
+            known_cast=known_cast,
+            dialogue_samples=samples,
+        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+        payload = json.dumps(
+            {
+                "system_instruction": {"parts": [{"text": sys_inst}]},
+                "contents": [{"role": "user", "parts": [{"text": usr_prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
+            },
+            ensure_ascii=False,
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.current_api_key,
+        }
+        try:
+            check_cancelled(self.cancel)
+            response = requests.request(
+                "POST", url, headers=headers, data=payload, timeout=GEMINI_REQUEST_TIMEOUT
+            )
+            check_cancelled(self.cancel)
+            if self._is_rate_limited_response(response):
+                self._handle_rate_limited_key(response)
+            response.raise_for_status()
+            parts = json.loads(response.text)["candidates"][0]["content"]["parts"]
+            raw_text = "".join(
+                part.get("text", "") for part in parts if isinstance(part, dict) and not part.get("thought")
+            ).strip()
+            raw_text = re.sub(r"^```json\s*(.*?)\s*```$", r"\1", raw_text, flags=re.DOTALL).strip()
+            parsed = json_tricks.loads(raw_text)
+            bible = normalize_bible(parsed, known_cast=known_cast, overview=meta.get("overview", ""))
+            save_cached_bible(cache_id, bible)
+            logger.info(
+                "Built Context Bible for %s (%d characters, %d glossary terms)",
+                meta.get("title") or self.source_srt_file,
+                len(bible.get("characters", [])),
+                len(bible.get("glossary", [])),
+            )
+            return bible
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            logger.debug("Context Bible LLM pre-pass skipped (%s); using metadata fallback", type(exc).__name__)
+            return normalize_bible({}, known_cast=known_cast, overview=meta.get("overview", ""))
+
+    def _resolve_audio_speaker_genders(self, scene_blocks: list) -> None:
+        if not self.video_path or not os.path.isfile(self.video_path):
+            return
+        try:
+            if os.path.getsize(self.video_path) < 4096:
+                return
+        except OSError:
+            return
+
+        ambiguous_cues = find_gender_ambiguous_cues(scene_blocks, bible=self.context_bible, max_probes=24)
+        if not ambiguous_cues:
+            return
+
+        clips: list = []
+        for cue in ambiguous_cues:
+            check_cancelled(self.cancel)
+            wav_b64 = extract_audio_microclip_wav_b64(
+                self.video_path, cue.start_seconds, cue.end_seconds
+            )
+            if wav_b64:
+                clips.append((cue, wav_b64))
+
+        if not clips:
+            return
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+        cue_by_idx = {cue.index: cue for cue, _ in clips}
+
+        for chunk_start in range(0, len(clips), 10):
+            chunk = clips[chunk_start : chunk_start + 10]
+            payload = json.dumps(build_audio_gender_probe_payload(chunk), ensure_ascii=False)
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": self.current_api_key,
+            }
+            try:
+                check_cancelled(self.cancel)
+                response = requests.request(
+                    "POST", url, headers=headers, data=payload, timeout=GEMINI_REQUEST_TIMEOUT
+                )
+                check_cancelled(self.cancel)
+                if self._is_rate_limited_response(response):
+                    self._handle_rate_limited_key(response)
+                response.raise_for_status()
+                parts = json.loads(response.text)["candidates"][0]["content"]["parts"]
+                raw_text = "".join(
+                    part.get("text", "") for part in parts if isinstance(part, dict) and not part.get("thought")
+                ).strip()
+                raw_text = re.sub(r"^```json\s*(.*?)\s*```$", r"\1", raw_text, flags=re.DOTALL).strip()
+                parsed = json_tricks.loads(raw_text)
+                if isinstance(parsed, dict):
+                    for k in ("results", "cues", "data", "items"):
+                        if isinstance(parsed.get(k), list):
+                            parsed = parsed[k]
+                            break
+                if isinstance(parsed, list):
+                    for entry in parsed:
+                        if not isinstance(entry, dict):
+                            continue
+                        idx_str = str(entry.get("index", "")).strip()
+                        gender = str(entry.get("speaker_gender", "")).strip().upper()
+                        if idx_str in cue_by_idx and gender in ("F", "M"):
+                            cue_by_idx[idx_str].speaker_gender = gender
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                logger.debug("Audio gender micro-probe skipped (%s)", type(exc).__name__)
+
+    def _build_generate_payload(
+        self,
+        batch: List[SubtitleObject],
+        previous_context: List[str] = None,
+        next_context: List[str] = None,
+    ) -> dict:
+        bible_json = format_bible_for_prompt(self.context_bible)
+        user_body: object = batch
+        if previous_context or next_context:
+            envelope: dict = {}
+            if previous_context:
+                envelope["previous_scene_context"] = list(previous_context)
+            envelope["cues"] = batch
+            if next_context:
+                envelope["next_scene_context"] = list(next_context)
+            user_body = envelope
+        payload = {
             "system_instruction": {
                 "parts": [
                     {
-                        "text": self.get_instruction(self.target_language, self.description)
+                        "text": self.get_instruction(
+                            self.target_language,
+                            self.description,
+                            bible_json=bible_json,
+                        )
                     }
                 ]
             },
@@ -386,12 +595,19 @@ class GeminiTranslatorService:
                     "role": "user",
                     "parts": [
                         {
-                            "text": json.dumps(batch, ensure_ascii=False)
+                            "text": json.dumps(user_body, ensure_ascii=False)
                         }
                     ]
                 }
             ]
         }
+        if bible_json or previous_context or next_context:
+            payload["generationConfig"] = {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
+            }
+        return payload
 
     current_progress = 0
 
@@ -400,7 +616,9 @@ class GeminiTranslatorService:
             batch: List[SubtitleObject],  # Changed from list[SubtitleObject]
             translated_subtitle: List[Subtitle],  # Changed from list[Subtitle]
             total: int,
-            retry_num=3
+            retry_num=3,
+            previous_context: List[str] = None,
+            next_context: List[str] = None
     ):
         """
         Process a batch of subtitles for translation with accurate progress tracking.
@@ -415,7 +633,10 @@ class GeminiTranslatorService:
         # into job messages and the log.
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
 
-        payload = json.dumps(self._build_generate_payload(batch), ensure_ascii=False)
+        payload = json.dumps(
+            self._build_generate_payload(batch, previous_context=previous_context, next_context=next_context),
+            ensure_ascii=False,
+        )
         headers = {
             'Content-Type': 'application/json',
             'x-goog-api-key': self.current_api_key,
@@ -435,9 +656,16 @@ class GeminiTranslatorService:
                 return cleaned_string.strip()
 
             parts = json.loads(response.text)['candidates'][0]['content']['parts']
-            result = clean_json_string(''.join(part['text'] for part in parts))
+            result = clean_json_string(
+                ''.join(part['text'] for part in parts if isinstance(part, dict) and not part.get('thought'))
+            )
 
             translated_lines = json_tricks.loads(result)
+            if isinstance(translated_lines, dict):
+                for wrap_key in ('cues', 'translations', 'lines', 'subtitles', 'results', 'data'):
+                    if isinstance(translated_lines.get(wrap_key), list):
+                        translated_lines = translated_lines[wrap_key]
+                        break
             if not isinstance(translated_lines, list):
                 # Nothing to realign by index: the reply is not the shape the
                 # batch asks for, so the retry below re-asks for it.
@@ -500,10 +728,24 @@ class GeminiTranslatorService:
             if self._is_rate_limited_response(response):
                 self._handle_rate_limited_key(response)
                 if retry_num > 0:
-                    return self._process_batch(batch, translated_subtitle, total, retry_num - 1)
+                    return self._process_batch(
+                        batch,
+                        translated_subtitle,
+                        total,
+                        retry_num - 1,
+                        previous_context=previous_context,
+                        next_context=next_context,
+                    )
 
             if retry_num > 0:
-                return self._process_batch(batch, translated_subtitle, total, retry_num - 1)
+                return self._process_batch(
+                    batch,
+                    translated_subtitle,
+                    total,
+                    retry_num - 1,
+                    previous_context=previous_context,
+                    next_context=next_context,
+                )
             else:
                 jobs_queue.update_job_progress(job_id=self.job_id, progress_message=f"Translation request failed: {e}")
                 raise e
@@ -601,36 +843,73 @@ class GeminiTranslatorService:
 
                     i = self.start_line - 1
                     total = len(original_subtitle)
-                    batch = [SubtitleObject(index=str(i), content=original_subtitle[i].content)]
-                    i += 1
 
-                    # Save initial progress
-                    self._save_progress(i)
+                    if self._should_use_context_bible(total):
+                        self.context_bible = self._ensure_context_bible(original_subtitle)
+                        scene_blocks = build_scene_blocks(
+                            original_subtitle,
+                            start_index=i,
+                            max_block_size=min(self.batch_size, DEFAULT_MAX_SCENE_BLOCK_CUES),
+                        )
+                        self._resolve_audio_speaker_genders(scene_blocks)
+                        self._save_progress(i + 1)
+                        jobs_queue.update_job_progress(
+                            job_id=self.job_id,
+                            progress_max=total,
+                            progress_message=self.source_srt_file,
+                        )
+                        for block in scene_blocks:
+                            if self.interrupt_flag:
+                                break
+                            block_batch = [cue.to_prompt_dict() for cue in block.cues]
+                            last_idx = int(block.cues[-1].index) + 1 if block.cues else i + 1
+                            try:
+                                start_time = time.time()
+                                self._process_batch(
+                                    block_batch,
+                                    translated_subtitle,
+                                    total,
+                                    previous_context=block.previous_context,
+                                    next_context=block.next_context,
+                                )
+                                end_time = time.time()
+                                self._save_progress(last_idx + 1)
+                                if delay and (end_time - start_time < delay_time) and last_idx < total:
+                                    time.sleep(delay_time - (end_time - start_time))
+                            except Exception as e:
+                                self._clear_progress()
+                                raise e
+                    else:
+                        batch = [SubtitleObject(index=str(i), content=original_subtitle[i].content)]
+                        i += 1
 
-                    jobs_queue.update_job_progress(job_id=self.job_id, progress_max=total,
-                                                   progress_message=self.source_srt_file)
+                        # Save initial progress
+                        self._save_progress(i)
 
-                    while (i < total or len(batch) > 0) and not self.interrupt_flag:
-                        if i < total and len(batch) < self.batch_size:
-                            batch.append(SubtitleObject(index=str(i), content=original_subtitle[i].content))
-                            i += 1
-                            continue
+                        jobs_queue.update_job_progress(job_id=self.job_id, progress_max=total,
+                                                       progress_message=self.source_srt_file)
 
-                        try:
-                            start_time = time.time()
-                            self._process_batch(batch, translated_subtitle, total)
-                            end_time = time.time()
+                        while (i < total or len(batch) > 0) and not self.interrupt_flag:
+                            if i < total and len(batch) < self.batch_size:
+                                batch.append(SubtitleObject(index=str(i), content=original_subtitle[i].content))
+                                i += 1
+                                continue
 
-                            # Save progress after each batch
-                            self._save_progress(i + 1)
+                            try:
+                                start_time = time.time()
+                                self._process_batch(batch, translated_subtitle, total)
+                                end_time = time.time()
 
-                            if delay and (end_time - start_time < delay_time) and i < total:
-                                time.sleep(delay_time - (end_time - start_time))
+                                # Save progress after each batch
+                                self._save_progress(i + 1)
 
-                        except Exception as e:
-                            self._clear_progress()
-                            # File will be automatically closed by the with statement
-                            raise e
+                                if delay and (end_time - start_time < delay_time) and i < total:
+                                    time.sleep(delay_time - (end_time - start_time))
+
+                            except Exception as e:
+                                self._clear_progress()
+                                # File will be automatically closed by the with statement
+                                raise e
 
                     # Check if we exited the loop due to an interrupt
                     jobs_queue.update_job_progress(job_id=self.job_id, progress_value=total,
