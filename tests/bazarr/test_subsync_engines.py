@@ -990,3 +990,161 @@ def test_normalize_subtitle_language_variant_preserves_sync_modifier():
     from subtitles.indexer.utils import normalize_subtitle_language_variant
 
     assert normalize_subtitle_language_variant('en:sync-alass') == 'en:sync-alass'
+    assert normalize_subtitle_language_variant('pb:sync-elasticsync') == 'pb:sync-elasticsync'
+
+
+def test_elasticsync_output_detection_and_language_modifier():
+    from subtitles.indexer.utils import subtitle_language_with_sync_modifier
+    from subtitles.tools.subsync_engines import is_sync_engine_language_key, is_sync_engine_output
+
+    assert is_sync_engine_output('Movie.pt-BR.elasticsync.srt')
+    assert is_sync_engine_language_key('pb:sync-elasticsync')
+    assert subtitle_language_with_sync_modifier('pb', 'Movie.pb.elasticsync.srt') == 'pb:sync-elasticsync'
+
+
+def test_elasticsync_corrects_progressive_drift_and_cut_jump_across_languages(tmp_path, monkeypatch):
+    import pysubs2
+    from subtitles.tools import subsyncer as subsyncer_module
+    from subtitles.tools.subsync_engines import InMemorySubsyncFailureStore, SubsyncEngineRunner
+
+    monkeypatch.setattr(
+        subsyncer_module,
+        'SubsyncEngineRunner',
+        lambda: SubsyncEngineRunner(InMemorySubsyncFailureStore()),
+    )
+
+    ref_file = tmp_path / 'Movie.en.srt'
+    target_file = tmp_path / 'Movie.pt-BR.srt'
+    video_file = tmp_path / 'Movie.mkv'
+    _write(video_file, 'video')
+
+    ref_subs = pysubs2.SSAFile()
+    target_subs = pysubs2.SSAFile()
+
+    en_lines = [
+        'Sarah Connor, are you ready for 2029?',
+        'Yes Kyle, I saw 3 machines near Cyberdyne!',
+        'Wait for Doctor Silberman at 08:30.',
+        'Why is John calling Tokyo now?',
+        'Because Skynet activated protocol 42!',
+        'Run to the bunker, Sarah!',
+        'I cannot leave John behind.',
+        'The door is locked from outside!',
+        'Use code 7741 on the terminal.',
+        'Did it work, Kyle?',
+        'Yes, the gate is opening now!',
+        'Look at the sky over Los Angeles.',
+        'We have 15 minutes before dawn.',
+        'Stay close to Sarah and John!',
+        'Is everyone inside the tunnel?',
+        'Yes, close the blast door now!',
+    ]
+    pt_lines = [
+        'Sarah Connor, você está pronta para 2029?',
+        'Sim Kyle, eu vi 3 máquinas perto da Cyberdyne!',
+        'Espere pelo Doutor Silberman às 08:30.',
+        'Por que John está ligando para Tokyo agora?',
+        'Porque a Skynet ativou o protocolo 42!',
+        'Corra para o bunker, Sarah!',
+        'Eu não posso deixar John para trás.',
+        'A porta está trancada por fora!',
+        'Use o código 7741 no terminal.',
+        'Funcionou, Kyle?',
+        'Sim, o portão está abrindo agora!',
+        'Olhe para o céu sobre Los Angeles.',
+        'Temos 15 minutos antes do amanhecer.',
+        'Fique perto de Sarah e John!',
+        'Todos estão dentro do túnel?',
+        'Sim, feche a porta blindada agora!',
+    ]
+
+    for idx, (en_text, pt_text) in enumerate(zip(en_lines, pt_lines)):
+        # Reference true start times: every 8 seconds, plus a +4.5s commercial cut jump after cue 8
+        true_start = 10.0 + idx * 8.0 + (4.5 if idx >= 8 else 0.0)
+        true_end = true_start + 2.4
+        ref_subs.append(
+            pysubs2.SSAEvent(
+                start=int(round(true_start * 1000)),
+                end=int(round(true_end * 1000)),
+                text=en_text,
+            )
+        )
+        # Target subtitle is unshifted (no cut jump) and has a 1.03x progressive framerate drift + 2s offset
+        drifted_start = (10.0 + idx * 8.0 - 2.0) / 1.03
+        drifted_end = drifted_start + 2.3
+        target_subs.append(
+            pysubs2.SSAEvent(
+                start=int(round(drifted_start * 1000)),
+                end=int(round(drifted_end * 1000)),
+                text=pt_text,
+            )
+        )
+
+    ref_subs.save(str(ref_file), encoding='utf-8')
+    target_subs.save(str(target_file), encoding='utf-8')
+
+    result = subsyncer_module.SubSyncer().sync(
+        video_path=str(video_file),
+        srt_path=str(target_file),
+        srt_lang='pb',
+        hi=False,
+        forced=False,
+        max_offset_seconds='60',
+        no_fix_framerate=False,
+        gss=True,
+        reference=str(ref_file),
+        force_sync=True,
+        output_mode='overwrite',
+        enabled_engines=['elasticsync'],
+        write_history=False,
+    )
+
+    assert result.success
+    assert [r.engine for r in result.successful_results] == ['elasticsync']
+    synced = pysubs2.load(str(target_file), encoding='utf-8')
+    assert len(synced) == len(ref_subs)
+    # Both early cues (before cut) and late cues (after +4.5s cut + drift) must align closely
+    for i in (0, 3, 7, 8, 12, 15):
+        err_sec = abs(synced[i].start - ref_subs[i].start) / 1000.0
+        assert err_sec < 0.5, f'Cue {i} error {err_sec:.3f}s too large'
+
+
+def test_elasticsync_declines_without_reference_subtitle_track(tmp_path, monkeypatch):
+    from subtitles.tools import elasticsync, subsyncer as subsyncer_module
+    from subtitles.tools.subsync_engines import (
+        OUTPUT_MODE_KEEP_ALL,
+        REASON_ENGINE_DECLINED,
+        RESULT_FAILED,
+        InMemorySubsyncFailureStore,
+        SubsyncEngineRunner,
+    )
+
+    store = InMemorySubsyncFailureStore()
+    monkeypatch.setattr(subsyncer_module, 'SubsyncEngineRunner', lambda: SubsyncEngineRunner(store))
+    monkeypatch.setattr(elasticsync, '_extract_embedded_subtitle_track', lambda *a, **k: None)
+
+    video_file = tmp_path / 'Movie.mkv'
+    target_file = tmp_path / 'Movie.pt-BR.srt'
+    _write(video_file, 'video')
+    _write(target_file, '1\n00:00:01,000 --> 00:00:03,000\nOlá mundo\n')
+
+    result = subsyncer_module.SubSyncer().sync(
+        video_path=str(video_file),
+        srt_path=str(target_file),
+        srt_lang='pb',
+        hi=False,
+        forced=False,
+        max_offset_seconds='60',
+        no_fix_framerate=False,
+        gss=True,
+        force_sync=True,
+        output_mode=OUTPUT_MODE_KEEP_ALL,
+        enabled_engines=['elasticsync'],
+        write_history=False,
+    )
+
+    assert not result.success
+    assert result.results[0].status == RESULT_FAILED
+    assert result.results[0].reason == REASON_ENGINE_DECLINED
+    assert store.failure_count(str(target_file), 'elasticsync') == 0
+

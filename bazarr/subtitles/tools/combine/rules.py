@@ -18,7 +18,7 @@ _PLAIN = 0
 _HI = 1
 _FORCED = 2
 
-_SYNC_ENGINES = ("ffsubsync", "autosubsync", "alass")
+_SYNC_ENGINES = ("ffsubsync", "autosubsync", "alass", "elasticsync")
 
 
 def resolve_source_paths(video_path, languages):
