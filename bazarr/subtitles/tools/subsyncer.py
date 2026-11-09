@@ -363,9 +363,24 @@ class SubSyncer:
             if log_dir_path:
                 shutil.rmtree(log_dir_path, ignore_errors=True)
 
+    def _run_elasticsync_engine(self, output_path, video_path, reference=None):
+        from subtitles.tools.elasticsync import run_elasticsync
+
+        ref_arg = self.reference or reference or video_path
+        stream_spec = reference if (isinstance(reference, str) and reference.startswith('s:')) else None
+        return run_elasticsync(
+            reference=ref_arg,
+            subtitle_file=self.srtin,
+            output_file=str(output_path),
+            video_path=video_path,
+            stream_spec=stream_spec,
+        )
+
     def _run_external_engine(self, engine, output_path, video_path):
         if engine == 'autosubsync':
             return self._run_autosubsync_engine(output_path=output_path, video_path=video_path)
+        if engine == 'elasticsync':
+            return self._run_elasticsync_engine(output_path=output_path, video_path=video_path)
 
         executable = None
         if engine == 'alass':

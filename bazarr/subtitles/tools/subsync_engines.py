@@ -474,10 +474,10 @@ class SubtitleDestinationChanged(Exception):
     """A user changed or deleted this engine's destination after enqueueing."""
 
 
-SYNC_ENGINES = ('ffsubsync', 'autosubsync', 'alass')
+SYNC_ENGINES = ('ffsubsync', 'autosubsync', 'alass', 'elasticsync')
 SYNC_ENGINE_OUTPUT_MARKERS = tuple(f'.{engine}.' for engine in SYNC_ENGINES)
 SYNC_ENGINE_LANGUAGE_MODIFIERS = tuple(f'sync-{engine}' for engine in SYNC_ENGINES)
-DEFAULT_ENABLED_ENGINES = list(SYNC_ENGINES)
+DEFAULT_ENABLED_ENGINES = ['ffsubsync', 'autosubsync', 'alass']
 OUTPUT_MODE_OVERWRITE = 'overwrite'
 OUTPUT_MODE_KEEP_ALL = 'keep_all'
 SUPPORTED_OUTPUT_MODES = (OUTPUT_MODE_OVERWRITE, OUTPUT_MODE_KEEP_ALL)
@@ -521,6 +521,7 @@ ENGINE_LABELS = {
     'ffsubsync': 'FFsubsync',
     'autosubsync': 'Autosubsync',
     'alass': 'ALASS',
+    'elasticsync': 'ElasticSync',
 }
 
 
